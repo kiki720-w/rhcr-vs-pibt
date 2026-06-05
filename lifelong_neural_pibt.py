@@ -18,7 +18,7 @@ Position = Tuple[int, int]
 class LifelongPIBTConfig:
     H: int = 32
     W: int = 32
-    N_AGENTS: int = 24
+    N_AGENTS: int = 40
     TOTAL_STEPS: int = 500
 
     # PIBT / scoring weights
@@ -27,15 +27,17 @@ class LifelongPIBTConfig:
     W_CONFLICT: float = 12.0
 
     # Neural heatmap guidance
-    # 这版主要用 heatmap 改 priority，而不是单纯改 candidate score
     W_CONGESTION: float = 0.5
 
-    # 是否让 heatmap 也作为 candidate reward
-    # 先默认 True，但主要贡献来自 priority ordering
-    USE_HEATMAP_REWARD: bool = True
+    # Priority-only main method:
+    # False = heatmap only changes priority ordering, not candidate movement score
+    USE_HEATMAP_REWARD: bool = False
 
     # Neural update frequency
     NEURAL_UPDATE_PERIOD: int = 5
+
+    # Stuck metric: consecutive no-progress steps
+    STUCK_THRESHOLD: int = 3
 
     # U-Net model
     MODEL_PATH: str = "./checkpoints_multi/best_model_multi.pth"
@@ -102,7 +104,7 @@ def get_bfs_distance_map(obs: torch.Tensor, goal: Position):
 
 
 # =====================================================
-# 2. Collision check and repair
+# 2. Collision check, repair, and waiting/stuck metrics
 # =====================================================
 def count_step_collisions(current: List[Position], next_pos: List[Position]):
     collisions = 0
@@ -141,7 +143,7 @@ def repair_collisions(current: List[Position], next_pos: List[Position]):
         for i, p in enumerate(repaired):
             pos_to_agents.setdefault(p, []).append(i)
 
-        for pos, agents in pos_to_agents.items():
+        for _, agents in pos_to_agents.items():
             if len(agents) > 1:
                 for agent_id in agents:
                     if repaired[agent_id] != current[agent_id]:
@@ -160,6 +162,54 @@ def repair_collisions(current: List[Position], next_pos: List[Position]):
                         changed = True
 
     return repaired
+
+
+def compute_waiting_and_stuck_metrics(
+    current: List[Position],
+    next_pos: List[Position],
+    dist_maps: List[torch.Tensor],
+    no_progress_streak: List[int],
+    cfg: LifelongPIBTConfig,
+):
+    """
+    waiting_steps:
+        agent stays in the same cell.
+
+    no_progress_steps:
+        agent does not get closer to its current goal.
+
+    stuck_steps:
+        agent has no progress for at least STUCK_THRESHOLD consecutive steps.
+    """
+    wait_steps = 0
+    no_progress_steps = 0
+    stuck_steps = 0
+
+    n = len(current)
+
+    for i in range(n):
+        cy, cx = current[i]
+        ny, nx = next_pos[i]
+
+        old_dist = float(dist_maps[i][cy, cx])
+        new_dist = float(dist_maps[i][ny, nx])
+
+        # agent did not move
+        if current[i] == next_pos[i]:
+            wait_steps += 1
+
+        # agent did not get closer to goal
+        if new_dist >= old_dist:
+            no_progress_steps += 1
+            no_progress_streak[i] += 1
+        else:
+            no_progress_streak[i] = 0
+
+        # consecutive no-progress means stuck
+        if no_progress_streak[i] >= cfg.STUCK_THRESHOLD:
+            stuck_steps += 1
+
+    return wait_steps, no_progress_steps, stuck_steps, no_progress_streak
 
 
 # =====================================================
@@ -317,17 +367,15 @@ def plan_one_step_pibt(
     """
     PIBT-like priority inheritance and backtracking.
 
-    Key change:
-    Neural heatmap is used mainly for priority ordering.
+    Vanilla:
+        priority = distance-to-goal
 
-    Vanilla priority:
-        far-from-goal agents move first.
+    Neural-Priority:
+        priority = predicted pressure at current agent position,
+                   then distance-to-goal
 
-    Neural priority:
-        high-pressure agents move first,
-        then far-from-goal agents.
-
-    Candidate score still optionally uses heatmap as a weak expert-flow reward.
+    Candidate heatmap reward is optional.
+    Main method currently uses USE_HEATMAP_REWARD=False.
     """
     n = len(current)
 
@@ -456,6 +504,12 @@ def run_lifelong_pibt_method(
     total_collisions = 0
     neural_calls = 0
 
+    # New metrics
+    total_wait_steps = 0
+    total_no_progress_steps = 0
+    total_stuck_steps = 0
+    no_progress_streak = [0 for _ in range(cfg.N_AGENTS)]
+
     start_time = time.time()
 
     congestion_map = build_zero_congestion(env.obs)
@@ -498,8 +552,24 @@ def run_lifelong_pibt_method(
 
         next_positions = repair_collisions(current, next_positions)
 
+        # Collision metric
         step_collisions = count_step_collisions(current, next_positions)
         total_collisions += step_collisions
+
+        # Waiting / stuck metrics
+        wait_steps, no_progress_steps, stuck_steps, no_progress_streak = (
+            compute_waiting_and_stuck_metrics(
+                current=current,
+                next_pos=next_positions,
+                dist_maps=dist_maps,
+                no_progress_streak=no_progress_streak,
+                cfg=cfg,
+            )
+        )
+
+        total_wait_steps += wait_steps
+        total_no_progress_steps += no_progress_steps
+        total_stuck_steps += stuck_steps
 
         _, newly_completed = env.step(next_positions)
 
@@ -510,11 +580,15 @@ def run_lifelong_pibt_method(
                 "tasks": env.completed_tasks,
                 "new": newly_completed,
                 "coll": total_collisions,
+                "wait": total_wait_steps,
+                "stuck": total_stuck_steps,
                 "thr": f"{throughput:.3f}",
             }
         )
 
     runtime = time.time() - start_time
+
+    total_agent_steps = cfg.TOTAL_STEPS * cfg.N_AGENTS
 
     return {
         "completed_tasks": env.completed_tasks,
@@ -523,6 +597,20 @@ def run_lifelong_pibt_method(
         "runtime": runtime,
         "runtime_per_step": runtime / cfg.TOTAL_STEPS,
         "neural_calls": neural_calls,
+
+        # Waiting metrics
+        "total_wait_steps": total_wait_steps,
+        "wait_ratio": total_wait_steps / max(1, total_agent_steps),
+        "avg_wait_steps_per_agent": total_wait_steps / max(1, cfg.N_AGENTS),
+
+        # No-progress metrics
+        "total_no_progress_steps": total_no_progress_steps,
+        "no_progress_ratio": total_no_progress_steps / max(1, total_agent_steps),
+
+        # Stuck metrics
+        "total_stuck_steps": total_stuck_steps,
+        "stuck_ratio": total_stuck_steps / max(1, total_agent_steps),
+        "avg_stuck_steps_per_agent": total_stuck_steps / max(1, cfg.N_AGENTS),
     }
 
 
@@ -557,14 +645,15 @@ def run_multi_seed():
     base_cfg = LifelongPIBTConfig(
         H=32,
         W=32,
-        N_AGENTS=24,
+        N_AGENTS=40,
         TOTAL_STEPS=500,
         W_GOAL=3.5,
         W_WAIT=1.0,
         W_CONFLICT=12.0,
         W_CONGESTION=0.5,
-        USE_HEATMAP_REWARD=True,
+        USE_HEATMAP_REWARD=False,
         NEURAL_UPDATE_PERIOD=5,
+        STUCK_THRESHOLD=3,
         SEED=42,
     )
 
@@ -575,6 +664,7 @@ def run_multi_seed():
     print(f"W_CONGESTION: {base_cfg.W_CONGESTION}")
     print(f"Use heatmap reward: {base_cfg.USE_HEATMAP_REWARD}")
     print(f"Neural update period: {base_cfg.NEURAL_UPDATE_PERIOD}")
+    print(f"Stuck threshold: {base_cfg.STUCK_THRESHOLD}")
     print(f"Device: {base_cfg.DEVICE}")
 
     model = load_unet_model(base_cfg)
@@ -598,6 +688,7 @@ def run_multi_seed():
             W_CONGESTION=base_cfg.W_CONGESTION,
             USE_HEATMAP_REWARD=base_cfg.USE_HEATMAP_REWARD,
             NEURAL_UPDATE_PERIOD=base_cfg.NEURAL_UPDATE_PERIOD,
+            STUCK_THRESHOLD=base_cfg.STUCK_THRESHOLD,
             MODEL_PATH=base_cfg.MODEL_PATH,
             DEVICE=base_cfg.DEVICE,
             SEED=seed,
@@ -623,12 +714,16 @@ def run_multi_seed():
             f"Vanilla tasks={vanilla['completed_tasks']}, "
             f"throughput={vanilla['throughput']:.6f}, "
             f"collisions={vanilla['collisions']}, "
+            f"wait_ratio={vanilla['wait_ratio']:.6f}, "
+            f"stuck_ratio={vanilla['stuck_ratio']:.6f}, "
             f"runtime={vanilla['runtime']:.2f}"
         )
         print(
             f"Neural  tasks={neural['completed_tasks']}, "
             f"throughput={neural['throughput']:.6f}, "
             f"collisions={neural['collisions']}, "
+            f"wait_ratio={neural['wait_ratio']:.6f}, "
+            f"stuck_ratio={neural['stuck_ratio']:.6f}, "
             f"runtime={neural['runtime']:.2f}, "
             f"neural_calls={neural['neural_calls']}"
         )
@@ -663,6 +758,24 @@ def run_multi_seed():
         f"Collisions: "
         f"vanilla={vanilla_summary['collisions_mean']:.2f} ± {vanilla_summary['collisions_std']:.2f} | "
         f"neural={neural_summary['collisions_mean']:.2f} ± {neural_summary['collisions_std']:.2f}"
+    )
+
+    print(
+        f"Wait ratio: "
+        f"vanilla={vanilla_summary['wait_ratio_mean']:.6f} ± {vanilla_summary['wait_ratio_std']:.6f} | "
+        f"neural={neural_summary['wait_ratio_mean']:.6f} ± {neural_summary['wait_ratio_std']:.6f}"
+    )
+
+    print(
+        f"No-progress ratio: "
+        f"vanilla={vanilla_summary['no_progress_ratio_mean']:.6f} ± {vanilla_summary['no_progress_ratio_std']:.6f} | "
+        f"neural={neural_summary['no_progress_ratio_mean']:.6f} ± {neural_summary['no_progress_ratio_std']:.6f}"
+    )
+
+    print(
+        f"Stuck ratio: "
+        f"vanilla={vanilla_summary['stuck_ratio_mean']:.6f} ± {vanilla_summary['stuck_ratio_std']:.6f} | "
+        f"neural={neural_summary['stuck_ratio_mean']:.6f} ± {neural_summary['stuck_ratio_std']:.6f}"
     )
 
     print(
